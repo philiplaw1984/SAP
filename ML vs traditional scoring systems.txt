@@ -1,0 +1,319 @@
+# 1. Load required packages
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+library(readr)
+library(patchwork)
+
+# 2. Read data
+data <- read_csv("fold_results_detailed.csv")
+
+# 3. Reshape data to long format
+data_long <- data %>%
+  pivot_longer(
+    cols = c(Accuracy, Precision, Recall, F1_Score, ROC_AUC, PR_AUC),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# 4. Global Friedman Test for all metrics
+friedman_results <- data_long %>%
+  group_by(Metric) %>%
+  summarise(
+    Friedman_Chi_Square = friedman_test(Value ~ Model | Fold)$statistic,
+    Friedman_p_value = friedman_test(Value ~ Model | Fold)$p,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Significance = case_when(
+      Friedman_p_value < 0.001 ~ "***",
+      Friedman_p_value < 0.01 ~ "**",
+      Friedman_p_value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+cat("=== GLOBAL FRIEDMAN TEST RESULTS ===\n")
+print(friedman_results, n = 6)
+
+# 5. Pairwise comparison function (all 6 metrics)
+perform_pairwise_comparisons <- function(ml_model, 
+                                        metrics_to_test = c("Accuracy", "Precision", "Recall", 
+                                                            "F1_Score", "ROC_AUC", "PR_AUC")) {
+  
+  results_list <- list()
+  
+  for(metric in metrics_to_test) {
+    # Extract machine learning model data
+    ml_data <- data %>%
+      filter(Model == ml_model) %>%
+      pull(!!sym(metric))
+    
+    # Compare with each traditional model
+    for(trad_model in c("Traditional_APACHEII", "Traditional_Ranson", "Traditional_BISAP")) {
+      trad_data <- data %>%
+        filter(Model == trad_model) %>%
+        pull(!!sym(metric))
+      
+      # Wilcoxon signed-rank test
+      test_result <- wilcox.test(ml_data, trad_data, 
+                                 paired = TRUE, 
+                                 alternative = "two.sided",
+                                 exact = FALSE)
+      
+      # Calculate effect size (r)
+      n <- length(ml_data)
+      r <- abs(qnorm(test_result$p.value/2)) / sqrt(n)
+      
+      # Store results
+      results_list[[paste(ml_model, trad_model, metric, sep = "_")]] <- data.frame(
+        Machine_Learning_Model = ml_model,
+        Traditional_Model = trad_model,
+        Metric = metric,
+        Wilcoxon_Z = qnorm(test_result$p.value/2),
+        Raw_p_value = test_result$p.value,
+        Effect_Size_r = r
+      )
+    }
+  }
+  
+  # Combine all results
+  pairwise_results <- bind_rows(results_list) %>%
+    group_by(Metric) %>%
+    mutate(
+      # Bonferroni correction: 3 comparisons per metric
+      Adjusted_p_value = p.adjust(Raw_p_value, method = "bonferroni", n = 3),
+      Significance = case_when(
+        Adjusted_p_value < 0.001 ~ "***",
+        Adjusted_p_value < 0.01 ~ "**",
+        Adjusted_p_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    ) %>%
+    ungroup()
+  
+  return(pairwise_results)
+}
+
+# 6. Perform comparisons for each ML model
+cat("\n=== PAIRWISE COMPARISON RESULTS ===\n")
+
+dual_xgb_results <- perform_pairwise_comparisons("Simp_Dual_XGBoost")
+dual_lda_results <- perform_pairwise_comparisons("Simp_Dual_Linear_Discriminant")
+
+# Combine all results
+all_pairwise_results <- bind_rows(
+  dual_xgb_results,
+  dual_lda_results
+)
+
+# Print significant results only
+significant_results <- all_pairwise_results %>%
+  filter(Adjusted_p_value < 0.05) %>%
+  arrange(Metric, Adjusted_p_value)
+
+cat("\nSignificant Differences (Adjusted p < 0.05):\n")
+if(nrow(significant_results) > 0) {
+  print(significant_results, n = nrow(significant_results))
+} else {
+  cat("No significant differences found after Bonferroni correction.\n")
+}
+
+# 7. Prepare data for visualization
+plot_data <- data_long %>%
+  mutate(
+    Model_Short = case_when(
+      Model == "Simp_Dual_XGBoost" ~ "Simp_Dual_XGB",
+      Model == "Simp_Dual_Linear_Discriminant" ~ "Simp_Dual_LDA",
+      Model == "Traditional_APACHEII" ~ "APACHEII",
+      Model == "Traditional_Ranson" ~ "Ranson",
+      Model == "Traditional_BISAP" ~ "BISAP",
+      TRUE ~ Model
+    ),
+    Model_Type = case_when(
+      Model %in% c("Simp_Dual_XGBoost", "Simp_Dual_Linear_Discriminant") ~ "ML Models",
+      TRUE ~ "Traditional Models"
+    )
+  )
+
+# Define model order for consistent plotting
+model_order <- c("Simp_Dual_XGB", "Simp_Dual_LDA", "APACHEII", "Ranson", "BISAP")
+plot_data$Model_Short <- factor(plot_data$Model_Short, levels = model_order)
+
+# Color scheme
+model_colors <- c(
+  "Simp_Dual_XGB" = "#E41A1C",      # Red
+  "Simp_Dual_LDA" = "#377EB8",    # Blue
+  "APACHEII" = "#984EA3",      # Purple
+  "Ranson" = "#FF7F00",        # Orange
+  "BISAP" = "#A65628"          # Brown
+)
+
+# 8. Create boxplot function for each metric
+create_boxplot <- function(metric_name) {
+  
+  metric_data <- plot_data %>%
+    filter(Metric == metric_name)
+  
+  # Prepare statistical annotation data
+  stat_data <- all_pairwise_results %>%
+    filter(Metric == metric_name) %>%
+    mutate(
+      group1 = case_when(
+        Machine_Learning_Model == "Simp_Dual_XGBoost" ~ "Simp_Dual_XGB",
+        Machine_Learning_Model == "Simp_Dual_Linear_Discriminant" ~ "Simp_Dual_LDA"
+      ),
+      group2 = case_when(
+        Traditional_Model == "Traditional_APACHEII" ~ "APACHEII",
+        Traditional_Model == "Traditional_Ranson" ~ "Ranson",
+        Traditional_Model == "Traditional_BISAP" ~ "BISAP"
+      )
+    ) %>%
+    filter(Adjusted_p_value < 0.05)  # Only significant comparisons
+  
+  # Create base boxplot
+  p <- ggplot(metric_data, aes(x = Model_Short, y = Value, fill = Model_Short)) +
+    geom_boxplot(outlier.shape = 21, outlier.size = 2, alpha = 0.8) +
+    geom_jitter(width = 0.15, size = 1.5, alpha = 0.6, color = "gray30") +
+    scale_fill_manual(values = model_colors, guide = FALSE) +
+    labs(
+      title = metric_name,
+      x = "Model",
+      y = metric_name
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+      axis.title = element_text(size = 10),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "grey80", fill = NA, size = 0.5)
+    )
+  
+  # Add significance annotations if any
+  if(nrow(stat_data) > 0) {
+    # Determine y positions for significance bars
+    y_max <- max(metric_data$Value)
+    y_step <- y_max * 0.08
+    
+    for(i in 1:nrow(stat_data)) {
+      y_pos <- y_max + (i * y_step)
+      
+      p <- p + geom_signif(
+        comparisons = list(c(stat_data$group1[i], stat_data$group2[i])),
+        annotations = stat_data$Significance[i],
+        y_position = y_pos,
+        tip_length = 0.01,
+        textsize = 3.5,
+        vjust = 0.5
+      )
+    }
+    
+    # Adjust y-axis limits to accommodate significance bars
+    p <- p + ylim(min(metric_data$Value) * 0.95, 
+                  max(metric_data$Value) + (nrow(stat_data) + 1) * y_step)
+  }
+  
+  return(p)
+}
+
+# 9. Generate boxplots for all metrics
+metrics <- c("Accuracy", "Precision", "Recall", "F1_Score", "ROC_AUC", "PR_AUC")
+boxplots <- map(metrics, create_boxplot)
+
+# 10. Arrange plots in a 2x3 grid
+combined_plot <- wrap_plots(boxplots, ncol = 3) +
+  plot_annotation(
+    title = "Performance Comparison: Simp_Machine Learning Models vs Traditional Scoring Models",
+    subtitle = "Boxplots show 30-fold cross-validation results\nSignificance based on Wilcoxon signed-rank test with Bonferroni correction",
+    caption = "ns: not significant, *: p < 0.05, **: p < 0.01, ***: p < 0.001",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      plot.caption = element_text(hjust = 0.5, size = 9)
+    )
+  )
+
+# 11. Save the combined plot
+ggsave("model_comparison_all_metrics.png", 
+       combined_plot, 
+       width = 16, 
+       height = 10, 
+       dpi = 300, 
+       bg = "white")
+
+cat("\nVisualization saved as: model_comparison_all_metrics.png\n")
+
+# 12. Generate descriptive statistics
+desc_stats <- plot_data %>%
+  group_by(Metric, Model, Model_Short, Model_Type) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    IQR = IQR(Value, na.rm = TRUE),
+    Min = min(Value, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Metric, desc(Mean))
+
+cat("\n=== DESCRIPTIVE STATISTICS ===\n")
+print(desc_stats, n = 30)
+
+# 13. Rank performance for each metric
+performance_ranks <- desc_stats %>%
+  group_by(Metric) %>%
+  mutate(
+    Rank = rank(-Mean, ties.method = "min"),
+    Performance_Level = case_when(
+      Rank == 1 ~ "Best",
+      Rank <= 3 ~ "Top 3",
+      TRUE ~ "Others"
+    )
+  ) %>%
+  arrange(Metric, Rank)
+
+cat("\n=== PERFORMANCE RANKING ===\n")
+print(performance_ranks, n = 36)
+
+# 14. Export results to CSV files
+write_csv(friedman_results, "friedman_test_results.csv")
+write_csv(all_pairwise_results, "pairwise_comparison_results.csv")
+write_csv(desc_stats, "descriptive_statistics.csv")
+write_csv(performance_ranks, "performance_ranking.csv")
+
+cat("\n=== FILES EXPORTED ===\n")
+cat("1. friedman_test_results.csv - Global Friedman test results\n")
+cat("2. pairwise_comparison_results.csv - Detailed pairwise comparisons\n")
+cat("3. descriptive_statistics.csv - Descriptive statistics for all models\n")
+cat("4. performance_ranking.csv - Performance ranking for each metric\n")
+cat("5. model_comparison_all_metrics.png - Combined boxplot visualization\n")
+
+# 15. Summary table of significant improvements
+summary_table <- all_pairwise_results %>%
+  filter(Adjusted_p_value < 0.05) %>%
+  group_by(Machine_Learning_Model, Metric) %>%
+  summarise(
+    Num_Significant_Improvements = n(),
+    Best_Improvement = min(Adjusted_p_value),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Num_Significant_Improvements), Metric)
+
+cat("\n=== SUMMARY OF SIGNIFICANT IMPROVEMENTS ===\n")
+print(summary_table, n = nrow(summary_table))
+
+# 16. Session information
+sink("analysis_session_info.txt")
+cat("ANALYSIS SESSION INFORMATION\n")
+cat("============================\n\n")
+cat("Analysis performed on:", date(), "\n\n")
+cat("R Session Info:\n")
+print(sessionInfo())
+sink()
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("All outputs have been generated in English.\n")
+cat("Check the CSV files and PNG image for detailed results.\n")
